@@ -1,0 +1,50 @@
+# Node modules
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Build output
+dist
+build
+
+# Testing
+coverage
+.nyc_output
+test
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Documentation
+*.md
+!README.md
+
+# Environment files (will be provided at runtime)
+.env
+.env.*
+
+# Logs
+logs
+*.log
+
+# Temporary files
+tmp
+temp

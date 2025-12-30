@@ -1,0 +1,315 @@
+# GitHub Actions workflow for automatic deployment
+name: 🚀 Deploy to Digital Ocean
+
+on:
+  push:
+    branches:
+      - main
+      - be
+  pull_request:
+    branches:
+      - main
+      - be
+  workflow_dispatch:
+
+env:
+  DEPLOY_PATH_MAIN: /root/skinalyze-be-v2
+  DEPLOY_PATH_BE: /root/skinalyze-be-v2-staging
+  BACKUP_SUFFIX: backup
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Set deployment path based on branch
+        id: set_path
+        run: |
+          if [ "${{ github.ref_name }}" == "main" ]; then
+            echo "deploy_path=${{ env.DEPLOY_PATH_MAIN }}" >> $GITHUB_OUTPUT
+            echo "environment=Production" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_path=${{ env.DEPLOY_PATH_BE }}" >> $GITHUB_OUTPUT
+            echo "environment=Staging" >> $GITHUB_OUTPUT
+          fi
+          echo "start_time=$(TZ='Asia/Ho_Chi_Minh' date +'%Y-%m-%d %H:%M:%S UTC+7')" >> $GITHUB_OUTPUT
+
+      - name: 🔔 Discord notification - Deployment started
+        uses: sarisia/actions-status-discord@v1
+        if: always()
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          status: ${{ job.status }}
+          title: '🚀 Skinalyze Backend - Deployment Started'
+          description: |
+            **━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━**
+            **📦 Repository:** Skinalyze Backend API
+            **🌍 Environment:** ${{ steps.set_path.outputs.environment }}
+            **🌿 Branch:** `${{ github.ref_name }}`
+            **💬 Commit:** ${{ github.event.head_commit.message }}
+            **👤 Triggered By:** ${{ github.actor }}
+            **⏱️ Started At:** ${{ steps.set_path.outputs.start_time }}
+            **📁 Deploy Path:** ${{ steps.set_path.outputs.deploy_path }}
+            **━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━**
+            ⚡ Deployment process initiated...
+          color: 0xFFA500
+          username: Rice Shower
+          avatar_url: https://media.tenor.com/KwkJpyhCtYoAAAAM/uma-musume-uma-musume-pretty-derby.gif
+
+      - name: 🔐 Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DO_HOST }} >> ~/.ssh/known_hosts
+
+      - name: 🧪 Test SSH connection
+        run: |
+          ssh ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} "echo '✅ SSH connection successful'"
+
+      - name: 💾 Backup current deployment
+        id: backup
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USERNAME }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          script_stop: false
+          script: |
+            DEPLOY_PATH="${{ steps.set_path.outputs.deploy_path }}"
+            BACKUP_TAG="backup-$(date +%Y%m%d-%H%M%S)"
+
+            echo "📁 Navigating to project directory..."
+            cd $DEPLOY_PATH
+
+            echo "💾 Creating backup tag for rollback..."
+            git tag -f ${{ env.BACKUP_SUFFIX }} || true
+            echo "backup_tag=${{ env.BACKUP_SUFFIX }}" >> $GITHUB_OUTPUT
+
+            echo "📸 Saving current commit hash..."
+            CURRENT_COMMIT=$(git rev-parse HEAD)
+            echo "Current commit: $CURRENT_COMMIT"
+            echo "$CURRENT_COMMIT" > .deployment-backup
+
+            echo "🏷️ Tagging current Docker images..."
+            docker tag skinalyze-app:latest skinalyze-app:$BACKUP_TAG || true
+
+            echo "✅ Backup complete: $BACKUP_TAG"
+
+      - name: 🚀 Deploy to Digital Ocean (Blue-Green Strategy)
+        id: deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USERNAME }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          script_stop: true
+          script: |
+            DEPLOY_PATH="${{ steps.set_path.outputs.deploy_path }}"
+
+            echo "📁 Navigating to project directory..."
+            cd $DEPLOY_PATH
+
+            echo "🔍 Checking current state..."
+            git status
+
+            echo "📥 Pulling latest code..."
+            git fetch origin
+            git clean -fd
+            git reset --hard origin/${{ github.ref_name }}
+            git pull origin ${{ github.ref_name }}
+
+            echo "✅ Code updated to commit:"
+            CURRENT_COMMIT=$(git log -1 --oneline)
+            echo "$CURRENT_COMMIT"
+
+            echo "🔍 Checking Docker..."
+            docker --version
+            docker-compose --version
+
+            echo "🔨 Building new app image (no cache)..."
+            docker-compose build --no-cache --pull app
+
+            echo "🔄 Stopping old containers..."
+            docker-compose down app
+
+            echo "🚀 Starting new containers..."
+            docker-compose up -d app
+
+            echo "⏳ Waiting for services to stabilize..."
+            sleep 20
+
+            echo "🏥 Checking final service health..."
+            docker-compose ps
+
+            echo "📋 Showing recent logs..."
+            docker-compose logs --tail=50 app
+
+            echo "✅ Deployment complete!"
+
+      - name: 🏥 Health Check
+        id: health_check
+        run: |
+          echo "⏳ Waiting for application to be ready..."
+          sleep 30
+
+          DEPLOY_PATH="${{ steps.set_path.outputs.deploy_path }}"
+
+          # Health check with retry
+          for i in {1..10}; do
+            if ssh ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} "curl -f -k https://api.nhatlonh.id.vn/api/v1 || curl -f http://localhost:3000/api/v1"; then
+              echo "✅ Health check passed!"
+              echo "health_status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "⏳ Attempt $i/10 failed, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "❌ Health check failed - initiating rollback..."
+          ssh ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} "cd $DEPLOY_PATH && docker-compose logs --tail=100 app"
+          echo "health_status=failed" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: 🔄 Rollback on Health Check Failure
+        if: failure() && steps.health_check.outcome == 'failure'
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USERNAME }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          script_stop: false
+          script: |
+            DEPLOY_PATH="${{ steps.set_path.outputs.deploy_path }}"
+
+            echo "🔄 Starting rollback process..."
+            cd $DEPLOY_PATH
+
+            echo "📋 Reading backup commit..."
+            if [ -f .deployment-backup ]; then
+              BACKUP_COMMIT=$(cat .deployment-backup)
+              echo "Found backup commit: $BACKUP_COMMIT"
+
+              echo "⏪ Rolling back to previous commit..."
+              git reset --hard $BACKUP_COMMIT
+
+              echo "🔄 Stopping failed containers..."
+              docker-compose down
+
+              echo "🔨 Rebuilding with backup code..."
+              docker-compose build --no-cache app
+
+              echo "🚀 Starting backup version..."
+              docker-compose up -d
+
+              echo "⏳ Waiting for rollback to complete..."
+              sleep 20
+
+              echo "🏥 Checking rollback health..."
+              docker-compose ps
+              docker-compose logs --tail=30 app
+
+              echo "✅ Rollback completed!"
+            else
+              echo "⚠️ No backup file found, manual intervention required!"
+              exit 1
+            fi
+
+      - name: 📊 Get deployment info
+        id: deployment_info
+        if: always()
+        run: |
+          DEPLOY_TIME=$(TZ='Asia/Ho_Chi_Minh' date +'%Y-%m-%d %H:%M:%S UTC+7')
+          echo "deploy_time=$DEPLOY_TIME" >> $GITHUB_OUTPUT
+
+          DEPLOY_PATH="${{ steps.set_path.outputs.deploy_path }}"
+
+          # Get container status
+          CONTAINER_STATUS=$(ssh ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} "cd $DEPLOY_PATH && docker-compose ps" || echo "Failed to get status")
+          echo "Container Status:"
+          echo "$CONTAINER_STATUS"
+
+          # Check if rollback occurred
+          if [ "${{ steps.health_check.outputs.health_status }}" == "failed" ]; then
+            echo "rollback_occurred=true" >> $GITHUB_OUTPUT
+          else
+            echo "rollback_occurred=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🎉 Discord notification - Deployment succeeded
+        uses: sarisia/actions-status-discord@v1
+        if: success()
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          status: 'Success'
+          content: '✅ <@&1385529547281403966> Deployment Succeeded!'
+
+          title: '✅ Skinalyze Backend - Deployment Successful!'
+          description: |
+            **━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━**
+            **📦 Repository:** Skinalyze Backend API
+            **🌍 Environment:** ${{ steps.set_path.outputs.environment }}
+            **📁 Deploy Path:** ${{ steps.set_path.outputs.deploy_path }}
+            **🌿 Branch:** `${{ github.ref_name }}`
+            **💬 Commit:** ${{ github.event.head_commit.message }}
+            **👤 Deployed By:** ${{ github.actor }}
+            **⏱️ Started At:** ${{ steps.set_path.outputs.start_time }}
+            **⏱️ Completed At:** ${{ steps.deployment_info.outputs.deploy_time }}
+            **🏥 Health Check:** ✅ Passed
+            **🔄 Deployment Type:** Rolling Deployment
+            **━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━**
+
+            **🔗 Quick Links:**
+            • [View Commit](${{ github.event.head_commit.url }})
+            • [API Documentation](https://skinalyze-be.nhatlonh.id.vn/api/docs)
+            • [Health Check](https://skinalyze-be.nhatlonh.id.vn/health)
+            • [View Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            🎉 **All services are running smoothly!**
+          color: 0x00FF00
+          username: Rice Shower
+          avatar_url: https://media.tenor.com/KwkJpyhCtYoAAAAM/uma-musume-uma-musume-pretty-derby.gif
+
+      - name: ❌ Discord notification - Deployment failed
+        uses: sarisia/actions-status-discord@v1
+        if: failure()
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          status: 'Failure'
+          content: '⚠️ <@&1385529547281403966> Deployment Failed!'
+
+          title: '❌ Skinalyze Backend - Deployment Failed!'
+          description: |
+            **━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━**
+            **📦 Repository:** Skinalyze Backend API
+            **🌍 Environment:** ${{ steps.set_path.outputs.environment }}
+            **📁 Deploy Path:** ${{ steps.set_path.outputs.deploy_path }}
+            **🌿 Branch:** `${{ github.ref_name }}`
+            **💬 Commit:** ${{ github.event.head_commit.message }}
+            **👤 Triggered By:** ${{ github.actor }}
+            **⏱️ Started At:** ${{ steps.set_path.outputs.start_time }}
+            **⏱️ Failed At:** ${{ steps.deployment_info.outputs.deploy_time }}
+            **❌ Status:** Deployment or health check failed
+            **🔄 Rollback:** ${{ steps.deployment_info.outputs.rollback_occurred == 'true' && '✅ Completed - Previous version restored' || '⚠️ Not executed' }}
+            **━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━**
+
+            **🔗 Troubleshooting Links:**
+            • [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            • [View Error Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            • [View Commit](${{ github.event.head_commit.url }})
+
+            ${{ steps.deployment_info.outputs.rollback_occurred == 'true' && '✅ **Automatic rollback completed. Service should be operational.**' || '⚠️ **Please check the logs and fix the issue!**' }}
+
+          color: 0xFF0000
+          username: Rice Shower
+          avatar_url: https://media.tenor.com/KwkJpyhCtYoAAAAM/uma-musume-uma-musume-pretty-derby.gif
+
+      - name: 📝 Get deployment logs
+        if: failure()
+        run: |
+          DEPLOY_PATH="${{ steps.set_path.outputs.deploy_path }}"
+          echo "Getting logs from failed deployment..."
+          ssh ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} "cd $DEPLOY_PATH && docker-compose logs --tail=100"
